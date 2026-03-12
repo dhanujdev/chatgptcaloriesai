@@ -1,129 +1,532 @@
 "use client";
 
-import Image from "next/image";
-import Link from "next/link";
-import {
-  useWidgetProps,
-  useMaxHeight,
-  useDisplayMode,
-  useRequestDisplayMode,
-  useIsChatGptApp,
-} from "./hooks";
+import { useCallback, useEffect, useRef, useState } from "react";
 
-export default function Home() {
-  const toolOutput = useWidgetProps<{
-    name?: string;
-    result?: { structuredContent?: { name?: string } };
-  }>();
-  const maxHeight = useMaxHeight() ?? undefined;
-  const displayMode = useDisplayMode();
-  const requestDisplayMode = useRequestDisplayMode();
-  const isChatGptApp = useIsChatGptApp();
+import { formatDate, shiftDate, todayDate } from "@/app/lib/date-utils";
+import type {
+  DashboardSnapshot,
+  MealSlot,
+  ToolPayload,
+  WeeklyTrendPoint,
+} from "@/app/lib/dashboard-types";
 
-  const name = toolOutput?.result?.structuredContent?.name || toolOutput?.name;
+type RpcRequest = {
+  jsonrpc: "2.0";
+  id: number;
+  method: string;
+  params?: unknown;
+};
+
+type RpcResponse = {
+  jsonrpc: "2.0";
+  id: number;
+  result?: unknown;
+  error?: { message?: string };
+};
+
+type RpcNotification = {
+  jsonrpc: "2.0";
+  method: string;
+  params?: unknown;
+};
+
+type ToolResultEnvelope = {
+  structuredContent?: ToolPayload | null;
+  content?: unknown;
+  _meta?: unknown;
+};
+
+type WidgetState = {
+  activeDate: string;
+  mealSlot: MealSlot;
+  composer: string;
+};
+
+type OpenAiBridge = {
+  toolOutput?: ToolPayload | ToolResultEnvelope | null;
+  widgetState?: WidgetState | null;
+  locale?: string;
+  callTool?: (name: string, args: Record<string, unknown>) => Promise<unknown>;
+  setWidgetState?: (state: WidgetState) => Promise<void> | void;
+};
+
+type SetGlobalsEvent = CustomEvent<{
+  globals?: Partial<OpenAiBridge>;
+}>;
+
+function getOpenAiBridge(): OpenAiBridge | undefined {
+  if (typeof window === "undefined") {
+    return undefined;
+  }
+  return (window as Window & { openai?: OpenAiBridge }).openai;
+}
+
+function extractDashboard(payload: ToolPayload | null | undefined): DashboardSnapshot | null {
+  if (!payload || typeof payload !== "object") return null;
+  if (payload.kind === "dashboard" && payload.dashboard) return payload.dashboard;
+  return null;
+}
+
+function unwrapToolPayload(raw: unknown): ToolPayload | null {
+  if (!raw || typeof raw !== "object") return null;
+  const payload = raw as Record<string, unknown>;
+
+  if ("structuredContent" in payload) {
+    const sc = payload.structuredContent;
+    if (sc && typeof sc === "object") return sc as ToolPayload;
+    return null;
+  }
+
+  if ("kind" in payload) return payload as ToolPayload;
+  return null;
+}
+
+function useMcpBridge(onPayload: (payload: ToolPayload) => void) {
+  const handlerRef = useRef(onPayload);
+  const pendingRef = useRef(
+    new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>()
+  );
+  const nextIdRef = useRef(1);
+  const [ready, setReady] = useState(() =>
+    typeof window !== "undefined" && typeof getOpenAiBridge()?.callTool === "function"
+  );
+
+  useEffect(() => {
+    handlerRef.current = onPayload;
+  }, [onPayload]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const handleMessage = (event: MessageEvent<RpcResponse | RpcNotification>) => {
+      if (event.source !== window.parent) {
+        return;
+      }
+
+      const message = event.data;
+      if (!message || message.jsonrpc !== "2.0") {
+        return;
+      }
+
+      if ("id" in message && typeof message.id === "number") {
+        const pending = pendingRef.current.get(message.id);
+        if (!pending) {
+          return;
+        }
+        pendingRef.current.delete(message.id);
+
+        if (message.error) {
+          pending.reject(new Error(message.error.message ?? "RPC request failed"));
+          return;
+        }
+
+        pending.resolve(message.result);
+        return;
+      }
+
+      if (
+        "method" in message &&
+        message.method === "ui/notifications/tool-result" &&
+        "params" in message &&
+        message.params
+      ) {
+        const payload = unwrapToolPayload(message.params as ToolPayload | ToolResultEnvelope);
+        if (payload) {
+          handlerRef.current(payload);
+        }
+      }
+    };
+
+    const handleSetGlobals = (event: Event) => {
+      const customEvent = event as SetGlobalsEvent;
+      if (typeof customEvent.detail?.globals?.callTool === "function") {
+        setReady(true);
+      }
+    };
+
+    window.addEventListener("message", handleMessage, { passive: true });
+    window.addEventListener("openai:set_globals", handleSetGlobals, { passive: true });
+
+    if (window.parent === window) {
+      return () => {
+        window.removeEventListener("message", handleMessage);
+        window.removeEventListener("openai:set_globals", handleSetGlobals);
+      };
+    }
+
+    const rpcRequest = (method: string, params?: unknown) =>
+      new Promise<unknown>((resolve, reject) => {
+        const id = nextIdRef.current++;
+        pendingRef.current.set(id, { resolve, reject });
+        const message: RpcRequest = { jsonrpc: "2.0", id, method, params };
+        window.parent.postMessage(message, "*");
+      });
+
+    const rpcNotify = (method: string, params?: unknown) => {
+      const message: RpcNotification = { jsonrpc: "2.0", method, params };
+      window.parent.postMessage(message, "*");
+    };
+
+    void rpcRequest("ui/initialize", {
+      appInfo: { name: "chatgpt-calories-ai", version: "0.1.0" },
+      appCapabilities: {},
+      protocolVersion: "2026-01-26",
+    })
+      .then(() => {
+        rpcNotify("ui/notifications/initialized", {});
+        setReady(true);
+      })
+      .catch(() => {
+        setReady(typeof getOpenAiBridge()?.callTool === "function");
+      });
+
+    return () => {
+      window.removeEventListener("message", handleMessage);
+      window.removeEventListener("openai:set_globals", handleSetGlobals);
+      pendingRef.current.clear();
+    };
+  }, []);
+
+  const callTool = useCallback(async (name: string, args: Record<string, unknown>) => {
+    if (typeof window === "undefined") {
+      return null;
+    }
+
+    if (getOpenAiBridge()?.callTool) {
+      const result = await getOpenAiBridge()?.callTool?.(name, args);
+      const payload = unwrapToolPayload(result as ToolResultEnvelope | ToolPayload);
+      if (payload) {
+        handlerRef.current(payload);
+      }
+      return result;
+    }
+
+    const id = nextIdRef.current++;
+    const response = await new Promise<unknown>((resolve, reject) => {
+      pendingRef.current.set(id, { resolve, reject });
+      const request: RpcRequest = {
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name, arguments: args },
+      };
+      window.parent.postMessage(request, "*");
+    });
+
+    const payload = unwrapToolPayload(response as ToolResultEnvelope | ToolPayload);
+    if (payload) {
+      handlerRef.current(payload);
+    }
+    return response;
+  }, []);
+
+  return { ready, callTool };
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
+function CalorieRing({
+  remaining,
+  consumed,
+  target,
+}: {
+  remaining: number;
+  consumed: number;
+  target: number;
+}) {
+  const radius = 86;
+  const circumference = 2 * Math.PI * radius;
+  const progress = clamp(consumed / Math.max(target, 1), 0, 1.2);
+  const over = consumed > target;
+  const dashOffset = circumference * (1 - Math.min(progress, 1));
 
   return (
-    <div
-      className="font-sans grid grid-rows-[20px_1fr_20px] items-center justify-items-center p-8 pb-20 gap-16 sm:p-20"
-      style={{
-        maxHeight,
-        height: displayMode === "fullscreen" ? maxHeight : undefined,
-      }}
-    >
-      {displayMode !== "fullscreen" && (
-        <button
-          aria-label="Enter fullscreen"
-          className="fixed top-4 right-4 z-50 rounded-full bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 shadow-lg ring-1 ring-slate-900/10 dark:ring-white/10 p-2.5 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors cursor-pointer"
-          onClick={() => requestDisplayMode("fullscreen")}
-        >
-          <svg
-            className="w-5 h-5"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth={1.5}
-            viewBox="0 0 24 24"
-            aria-hidden="true"
-          >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              d="M3.75 3.75v4.5m0-4.5h4.5m-4.5 0L9 9M3.75 20.25v-4.5m0 4.5h4.5m-4.5 0L9 15M20.25 3.75h-4.5m4.5 0v4.5m0-4.5L15 9m5.25 11.25h-4.5m4.5 0v-4.5m0 4.5L15 15"
-            />
-          </svg>
-        </button>
-      )}
-      <main className="flex flex-col gap-[32px] row-start-2 items-center sm:items-start">
-        {!isChatGptApp && (
-          <div className="bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 rounded-lg px-4 py-3 w-full">
-            <div className="flex items-center gap-3">
-              <svg
-                className="w-5 h-5 text-blue-600 dark:text-blue-400 flex-shrink-0"
-                fill="currentColor"
-                viewBox="0 0 20 20"
-                aria-hidden="true"
-              >
-                <path
-                  fillRule="evenodd"
-                  d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a.75.75 0 000 1.5h.253a.25.25 0 01.244.304l-.459 2.066A1.75 1.75 0 0010.747 15H11a.75.75 0 000-1.5h-.253a.25.25 0 01-.244-.304l.459-2.066A1.75 1.75 0 009.253 9H9z"
-                  clipRule="evenodd"
-                />
-              </svg>
-              <div className="flex-1 min-w-0">
-                <p className="text-sm text-blue-900 dark:text-blue-100 font-medium">
-                  This app relies on data from a ChatGPT session.
-                </p>
-                <p className="text-sm text-blue-900 dark:text-blue-100 font-medium">
-                  No{" "}
-                  <a
-                    href="https://developers.openai.com/apps-sdk/reference"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="underline hover:no-underline font-mono bg-blue-100 dark:bg-blue-900 px-1 py-0.5 rounded"
-                  >
-                    window.openai
-                  </a>{" "}
-                  property detected
-                </p>
-              </div>
-            </div>
-          </div>
-        )}
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
+    <div className="ring-wrap" aria-label="calorie progress">
+      <svg viewBox="0 0 200 200" role="presentation">
+        <circle className="ring-track" cx="100" cy="100" r={radius} />
+        <circle
+          className={`ring-fill ${over ? "ring-fill--over" : ""}`}
+          cx="100"
+          cy="100"
+          r={radius}
+          strokeDasharray={circumference}
+          strokeDashoffset={dashOffset}
         />
-        <ol className="font-mono list-inside list-decimal text-sm/6 text-center sm:text-left">
-          <li className="mb-2 tracking-[-.01em]">
-            Welcome to the ChatGPT Apps SDK Next.js Starter
-          </li>
-          <li className="mb-2 tracking-[-.01em]">
-            Name returned from tool call: {name ?? "..."}
-          </li>
-          <li className="mb-2 tracking-[-.01em]">MCP server path: /mcp</li>
-        </ol>
+      </svg>
+      <div className="ring-center">
+        <div className="ring-center__value">{Math.round(remaining)}</div>
+        <div className="ring-center__label">kcal left</div>
+      </div>
+    </div>
+  );
+}
 
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <Link
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:w-auto"
-            prefetch={false}
-            href="/custom-page"
+function MacroCard({
+  label,
+  remaining,
+  consumed,
+  target,
+  color,
+}: {
+  label: string;
+  remaining: number;
+  consumed: number;
+  target: number;
+  color: string;
+}) {
+  const progress = clamp((consumed / Math.max(target, 1)) * 100, 0, 100);
+
+  return (
+    <div className="card macro-card">
+      <div className="macro-card__label">{label}</div>
+      <div className="macro-card__value">{Math.round(remaining)}</div>
+      <div className="macro-card__unit">g left</div>
+      <div className="macro-card__bar">
+        <div
+          className="macro-card__bar-fill"
+          style={{ width: `${progress}%`, background: color }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function CompactTrend({ points }: { points: WeeklyTrendPoint[] }) {
+  const maxVal = Math.max(...points.map((p) => p.target), 1);
+
+  return (
+    <div className="card trend-card">
+      <div className="trend-card__title">7-day calories</div>
+      <div className="trend-bars">
+        {points.map((point) => {
+          const over = point.calories > point.target;
+          const height = (point.calories / maxVal) * 100;
+
+          return (
+            <div key={point.date} className="trend-col">
+              <div
+                className={`trend-bar ${over ? "trend-bar--over" : "trend-bar--under"}`}
+                style={{ height: `${height}%` }}
+              />
+              <span className="trend-day">
+                {new Date(`${point.date}T12:00:00Z`)
+                  .toLocaleDateString("en-US", { weekday: "short" })
+                  .slice(0, 2)}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+export default function Home() {
+  const initialPayload = unwrapToolPayload(getOpenAiBridge()?.toolOutput);
+  const initialDashboard = extractDashboard(initialPayload);
+
+  const [dashboard, setDashboard] = useState<DashboardSnapshot | null>(initialDashboard);
+  const [activeDate, setActiveDate] = useState(
+    getOpenAiBridge()?.widgetState?.activeDate ?? initialDashboard?.date ?? todayDate()
+  );
+  const [status, setStatus] = useState("Ready");
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  const didAutoHydrateRef = useRef(false);
+
+  const locale = getOpenAiBridge()?.locale ?? "en-US";
+
+  const applyPayload = useCallback((payload: ToolPayload) => {
+    if (payload.kind === "dashboard") {
+      setDashboard(payload.dashboard);
+      setActiveDate(payload.dashboard.date);
+    }
+  }, []);
+
+  const bridge = useMcpBridge(applyPayload);
+
+  const hydratedRef = useRef(!!initialDashboard);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || hydratedRef.current) {
+      return;
+    }
+
+    const tryHydrate = () => {
+      if (hydratedRef.current) return;
+
+      const payload = unwrapToolPayload(getOpenAiBridge()?.toolOutput);
+      if (payload) {
+        applyPayload(payload);
+        hydratedRef.current = true;
+      }
+
+      const ws = getOpenAiBridge()?.widgetState as WidgetState | null;
+      if (ws?.activeDate) {
+        setActiveDate(ws.activeDate);
+      }
+    };
+
+    const onSetGlobals = () => tryHydrate();
+    window.addEventListener("openai:set_globals", onSetGlobals, { passive: true });
+    const timer = window.setInterval(tryHydrate, 300);
+
+    tryHydrate();
+
+    return () => {
+      window.removeEventListener("openai:set_globals", onSetGlobals);
+      window.clearInterval(timer);
+    };
+  }, [applyPayload]);
+
+  useEffect(() => {
+    void getOpenAiBridge()?.setWidgetState?.({
+      activeDate,
+      mealSlot: "lunch",
+      composer: "",
+    });
+  }, [activeDate]);
+
+  const runTool = useCallback(
+    async (busyToken: string, nextStatus: string, name: string, args: Record<string, unknown>) => {
+      setBusyKey(busyToken);
+      setStatus(nextStatus);
+      try {
+        const response = await bridge.callTool(name, args);
+        const payload = unwrapToolPayload(response as ToolPayload | ToolResultEnvelope | null);
+        if (payload?.kind) {
+          applyPayload(payload);
+        }
+        setStatus("Synced");
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : "Tool call failed");
+      } finally {
+        setBusyKey((current) => (current === busyToken ? null : current));
+      }
+    },
+    [bridge, applyPayload]
+  );
+
+  const hydrateDashboard = useCallback(
+    async (force = false) => {
+      if (!bridge.ready) {
+        setStatus("Bridge connecting");
+        return;
+      }
+      if (!force && didAutoHydrateRef.current) {
+        return;
+      }
+
+      didAutoHydrateRef.current = true;
+      await runTool("hydrate", "Loading dashboard", "open_calorie_dashboard", {
+        date: activeDate,
+      });
+    },
+    [activeDate, bridge.ready, runTool]
+  );
+
+  useEffect(() => {
+    if (dashboard || !bridge.ready) {
+      return;
+    }
+    void hydrateDashboard();
+  }, [dashboard, bridge.ready, hydrateDashboard]);
+
+  async function handleDateChange(delta: number) {
+    const nextDate = shiftDate(activeDate, delta);
+    await runTool("day-swap", `Loading ${nextDate}`, "load_day_snapshot", {
+      date: nextDate,
+    });
+  }
+
+  if (!dashboard) {
+    return (
+      <main className="shell shell--empty">
+        <div className="card empty-card">
+          <h1>Calorie Command</h1>
+          <p>Open the dashboard from ChatGPT to see your calories.</p>
+          <button
+            type="button"
+            className="cta"
+            disabled={busyKey === "hydrate" || !bridge.ready}
+            onClick={() => void hydrateDashboard(true)}
           >
-            Visit another page
-          </Link>
-          <a
-            href="https://vercel.com/templates/ai/chatgpt-app-with-next-js"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="underline"
-          >
-            Deploy on Vercel
-          </a>
+            {busyKey === "hydrate" ? "Loading..." : "Load dashboard"}
+          </button>
+          <p className="empty-card__hint">{bridge.ready ? status : "Connecting..."}</p>
         </div>
       </main>
-    </div>
+    );
+  }
+
+  const { summary, weeklyTrend } = dashboard;
+
+  return (
+    <main className="shell">
+      <header className="header">
+        <span className="header__date">{formatDate(dashboard.date, locale)}</span>
+        <div className="header__nav">
+          <button type="button" className="nav-btn" onClick={() => void handleDateChange(-1)}>
+            &larr;
+          </button>
+          <button type="button" className="nav-btn" onClick={() => void handleDateChange(1)}>
+            &rarr;
+          </button>
+        </div>
+      </header>
+
+      <section className="card hero-card">
+        <CalorieRing
+          remaining={summary.remaining.calories}
+          consumed={summary.totals.calories}
+          target={summary.targets.calories}
+        />
+        <p className="hero-subtitle">
+          {Math.round(summary.totals.calories)} of {summary.targets.calories} kcal consumed
+        </p>
+      </section>
+
+      <div className="macro-row">
+        <MacroCard
+          label="Protein"
+          remaining={summary.remaining.protein}
+          consumed={summary.totals.protein}
+          target={summary.targets.protein}
+          color="var(--protein)"
+        />
+        <MacroCard
+          label="Carbs"
+          remaining={summary.remaining.carbs}
+          consumed={summary.totals.carbs}
+          target={summary.targets.carbs}
+          color="var(--carbs)"
+        />
+        <MacroCard
+          label="Fat"
+          remaining={summary.remaining.fat}
+          consumed={summary.totals.fat}
+          target={summary.targets.fat}
+          color="var(--fat)"
+        />
+      </div>
+
+      <CompactTrend points={weeklyTrend} />
+
+      <div className="card streak-card">
+        <div className="streak-card__left">
+          <span className="streak-card__days">{summary.streak} day streak</span>
+          <span className="streak-card__momentum">{summary.momentumLabel}</span>
+        </div>
+        <div>
+          <div className="streak-card__score">{summary.adherenceScore}</div>
+          <div className="streak-card__score-label">adherence</div>
+        </div>
+      </div>
+
+      {summary.coachNote && <p className="coach-note">{summary.coachNote}</p>}
+    </main>
   );
 }
