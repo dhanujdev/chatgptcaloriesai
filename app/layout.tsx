@@ -46,113 +46,131 @@ function NextChatSDKBootstrap({ baseUrl }: { baseUrl: string }) {
       <script>
         {"(" +
           (() => {
-            const baseUrl = window.innerBaseUrl;
-            const htmlElement = document.documentElement;
-            const observer = new MutationObserver((mutations) => {
-              mutations.forEach((mutation) => {
-                if (
-                  mutation.type === "attributes" &&
-                  mutation.target === htmlElement
-                ) {
-                  const attrName = mutation.attributeName;
-                  if (attrName && attrName !== "suppresshydrationwarning") {
-                    htmlElement.removeAttribute(attrName);
+            try {
+              const baseUrl = window.innerBaseUrl;
+              const appOrigin = new URL(baseUrl, window.location.href).origin;
+              const htmlElement = document.documentElement;
+
+              // ChatGPT may mutate root attributes before hydration. Keep the html element stable.
+              const observer = new MutationObserver((mutations) => {
+                mutations.forEach((mutation) => {
+                  if (
+                    mutation.type === "attributes" &&
+                    mutation.target === htmlElement
+                  ) {
+                    const attrName = mutation.attributeName;
+                    if (
+                      attrName &&
+                      attrName !== "suppresshydrationwarning" &&
+                      htmlElement.hasAttribute(attrName)
+                    ) {
+                      htmlElement.removeAttribute(attrName);
+                    }
                   }
-                }
+                });
               });
-            });
-            observer.observe(htmlElement, {
-              attributes: true,
-              attributeOldValue: true,
-            });
 
-            const originalReplaceState = history.replaceState;
-            history.replaceState = (s, unused, url) => {
-              const u = new URL(url ?? "", window.location.href);
-              const href = u.pathname + u.search + u.hash;
-              originalReplaceState.call(history, unused, href);
-            };
+              observer.observe(htmlElement, {
+                attributes: true,
+                attributeOldValue: true,
+              });
 
-            const originalPushState = history.pushState;
-            history.pushState = (s, unused, url) => {
-              const u = new URL(url ?? "", window.location.href);
-              const href = u.pathname + u.search + u.hash;
-              originalPushState.call(history, unused, href);
-            };
+              const originalReplaceState = history.replaceState;
+              history.replaceState = (state, unused, url) => {
+                try {
+                  const nextUrl = url == null ? null : new URL(url, window.location.href);
+                  const href = nextUrl
+                    ? nextUrl.pathname + nextUrl.search + nextUrl.hash
+                    : null;
+                  originalReplaceState.call(history, state, unused, href);
+                } catch {
+                  originalReplaceState.call(history, state, unused, url);
+                }
+              };
 
-            const appOrigin = new URL(baseUrl).origin;
-            const isInIframe = window.self !== window.top;
+              const originalPushState = history.pushState;
+              history.pushState = (state, unused, url) => {
+                try {
+                  const nextUrl = url == null ? null : new URL(url, window.location.href);
+                  const href = nextUrl
+                    ? nextUrl.pathname + nextUrl.search + nextUrl.hash
+                    : null;
+                  originalPushState.call(history, state, unused, href);
+                } catch {
+                  originalPushState.call(history, state, unused, url);
+                }
+              };
 
-            window.addEventListener(
-              "click",
-              (e) => {
-                const a = (e?.target as HTMLElement)?.closest("a");
-                if (!a || !a.href) return;
-                const url = new URL(a.href, window.location.href);
-                if (
-                  url.origin !== window.location.origin &&
-                  url.origin != appOrigin
-                ) {
+              window.addEventListener(
+                "click",
+                (e) => {
+                  const target = e?.target;
+                  if (!(target instanceof Element)) return;
+                  const link = target.closest("a");
+                  if (!link || !link.href) return;
+
+                  let linkUrl: URL;
                   try {
-                    if (window.openai) {
-                      window.openai?.openExternal({ href: a.href });
-                      e.preventDefault();
+                    linkUrl = new URL(link.href, window.location.href);
+                  } catch {
+                    return;
+                  }
+
+                  if (
+                    linkUrl.origin !== window.location.origin &&
+                    linkUrl.origin !== appOrigin
+                  ) {
+                    try {
+                      if (window.openai?.openExternal) {
+                        window.openai.openExternal({ href: link.href });
+                        e.preventDefault();
+                      }
+                    } catch {
+                      // no-op: in unsupported hosts, fall through to default navigation
+                    }
+                  }
+                },
+                true
+              );
+
+              const isInIframe = window.self !== window.top;
+              if (isInIframe && window.location.origin !== appOrigin) {
+                const originalFetch = window.fetch.bind(window);
+
+                window.fetch = (input: URL | RequestInfo, init?: RequestInit) => {
+                  try {
+                    let url: URL;
+                    if (typeof input === "string" || input instanceof URL) {
+                      url = new URL(input, window.location.href);
+                    } else {
+                      url = new URL(input.url, window.location.href);
+                    }
+
+                    if (url.origin === appOrigin || url.origin === window.location.origin) {
+                      if (url.origin === window.location.origin) {
+                        const nextUrl = new URL(baseUrl, window.location.href);
+                        nextUrl.pathname = url.pathname;
+                        nextUrl.search = url.search;
+                        nextUrl.hash = url.hash;
+                        url = nextUrl;
+                      }
+
+                      const nextInput =
+                        typeof input === "string" || input instanceof URL
+                          ? url.toString()
+                          : new Request(url.toString(), input);
+
+                      return originalFetch(nextInput, { ...init, mode: "cors" });
                     }
                   } catch {
-                    console.warn(
-                      "openExternal failed, likely not in OpenAI client"
-                    );
-                  }
-                }
-              },
-              true
-            );
-
-            if (isInIframe && window.location.origin !== appOrigin) {
-              const originalFetch = window.fetch;
-
-              window.fetch = (input: URL | RequestInfo, init?: RequestInit) => {
-                let url: URL;
-                if (typeof input === "string" || input instanceof URL) {
-                  url = new URL(input, window.location.href);
-                } else {
-                  url = new URL(input.url, window.location.href);
-                }
-
-                if (url.origin === appOrigin) {
-                  if (typeof input === "string" || input instanceof URL) {
-                    input = url.toString();
-                  } else {
-                    input = new Request(url.toString(), input);
+                    // Fall back to the native fetch behavior on any transformation error.
                   }
 
-                  return originalFetch.call(window, input, {
-                    ...init,
-                    mode: "cors",
-                  });
-                }
-
-                if (url.origin === window.location.origin) {
-                  const newUrl = new URL(baseUrl);
-                  newUrl.pathname = url.pathname;
-                  newUrl.search = url.search;
-                  newUrl.hash = url.hash;
-                  url = newUrl;
-
-                  if (typeof input === "string" || input instanceof URL) {
-                    input = url.toString();
-                  } else {
-                    input = new Request(url.toString(), input);
-                  }
-
-                  return originalFetch.call(window, input, {
-                    ...init,
-                    mode: "cors",
-                  });
-                }
-
-                return originalFetch.call(window, input, init);
-              };
+                  return originalFetch(input, init);
+                };
+              }
+            } catch {
+              // Prevent host crashes if the bootstrap patch cannot be applied in a client environment.
             }
           }).toString() +
           ")()"}

@@ -71,6 +71,16 @@ function unwrapToolPayload(raw: unknown): ToolPayload | null {
   if (!raw || typeof raw !== "object") return null;
   const payload = raw as Record<string, unknown>;
 
+  if ("result" in payload && payload.result && typeof payload.result === "object") {
+    const nestedResult = unwrapToolPayload(payload.result);
+    if (nestedResult) return nestedResult;
+  }
+
+  if ("output" in payload && payload.output && typeof payload.output === "object") {
+    const nestedOutput = unwrapToolPayload(payload.output);
+    if (nestedOutput) return nestedOutput;
+  }
+
   if ("structuredContent" in payload) {
     const sc = payload.structuredContent;
     if (sc && typeof sc === "object") return sc as ToolPayload;
@@ -451,7 +461,7 @@ export default function Home() {
           <button
             type="button"
             className="cta"
-            disabled={busyKey === "hydrate" || !bridge.ready}
+            disabled={busyKey === "hydrate"}
             onClick={() => void hydrateDashboard(true)}
           >
             {busyKey === "hydrate" ? "Loading..." : "Load dashboard"}
